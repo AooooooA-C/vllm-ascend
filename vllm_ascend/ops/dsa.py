@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.attention.benchmark_timer import ENABLED, module_scope
 from vllm_ascend.models.layer.attention.layer import DSAAttention
 
 
@@ -174,9 +175,16 @@ def dsa_forward(
         attn_metadata = forward_context.attn_metadata
     kv_cache = self.dsa_attn.kv_cache[forward_context.virtual_engine]
     kv_state = self.dsa_attn.kv_state[0]  # TODO support PP
-    self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states,
-                               kv_cache, attn_metadata, need_gather_q_kv,
-                               output, kv_state)
+    if ENABLED:
+        with module_scope(self.dsa_attn.layer_name, attn_metadata,
+                          self.dsa_attn.impl.vllm_config):
+            self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states,
+                                       kv_cache, attn_metadata, need_gather_q_kv,
+                                       output, kv_state)
+    else:
+        self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states,
+                                   kv_cache, attn_metadata, need_gather_q_kv,
+                                   output, kv_state)
     return
 
 

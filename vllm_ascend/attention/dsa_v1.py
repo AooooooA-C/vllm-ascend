@@ -20,6 +20,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.benchmark_timer import core_scope
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -42,6 +43,12 @@ else:
 
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
+
+
+def _timed_sparse_attention(*args, **kwargs):
+    # Keep the original operator and arguments; measure only its invocation.
+    with core_scope("sparse_attention"):
+        return torch.ops._C_ascend.npu_sparse_attn_sharedkv(*args, **kwargs)
 
 
 def hadamard_transform_ref(x: torch.Tensor, scale=1.0, attn_metadata=None):
@@ -1493,7 +1500,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 block_size=128)
 
         if self.compress_ratio == 1:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 ori_block_table=attn_metadata.prefill.prefill_swa_block_table,
@@ -1510,7 +1517,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="TND" if self.enable_kv_tnd else "PA_ND")[0]
         elif self.compress_ratio == 4:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 cmp_kv=compressed_kv.unsqueeze(1)
@@ -1533,7 +1540,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="TND" if self.enable_kv_tnd else "PA_ND")[0]
         else:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 cmp_kv=compressed_kv.unsqueeze(1)
@@ -1697,7 +1704,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compressed_kv_slot_mapping.unsqueeze(-1),
                 compressed_kv.view(-1, compressed_kv.shape[-1]))
         if self.compress_ratio == 1:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 ori_block_table=attn_metadata.decode.state_block_table,
@@ -1713,7 +1720,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="PA_ND")[0]
         elif self.compress_ratio == 4:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 cmp_kv=kv_cache[0],
@@ -1733,7 +1740,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="PA_ND")[0]
         else:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 cmp_kv=kv_cache[0],
