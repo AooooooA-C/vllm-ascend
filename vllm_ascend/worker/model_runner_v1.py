@@ -93,6 +93,7 @@ from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                update_attn_params,
                                                update_mla_attn_dcp_pcp_params,
                                                update_mla_attn_params)
+from vllm_ascend.core.benchmark_prefix_reuse import ENABLED as BENCHMARK_PREFIX_REUSE
 from vllm_ascend.core.kv_cache_spec import (Compress4AttentionSpec,
                                             Compress128AttentionSpec,
                                             CompressAttentionSpec)
@@ -3426,7 +3427,25 @@ class NPUModelRunner(GPUModelRunner):
                 if layer_id in [0, 1] or "mtp" in layer_name:
                     self.runner_only_attn_layers.add(layer_name)
                 elif layer_id % 2 == 0:
-                    if get_ascend_device_type() == AscendDeviceType.A5:
+                    if BENCHMARK_PREFIX_REUSE and get_ascend_device_type() == AscendDeviceType.A5:
+                        # This diagnostic uses the BF16 SparseAttnSharedkv path,
+                        # with the A5 FP8 indexer. Keep allocation/view/write
+                        # layouts consistent; packed FP8 main KV is a different op.
+                        kv_cache_spec[layer_name] = Compress4AttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=1,
+                            head_size=hf_config.head_dim,
+                            nope_dim=hf_config.head_dim - hf_config.rope_head_dim,
+                            rope_dim=hf_config.rope_head_dim,
+                            scale_dim=0,
+                            dtype=torch.bfloat16,
+                            compress_ratio=4,
+                            indexer_head_size=hf_config.index_head_dim,
+                            indexer_dtype=torch.float8_e4m3fn,
+                            indexer_scale_dim=1,
+                            indexer_scale_dtype=torch.float32,
+                        )
+                    elif get_ascend_device_type() == AscendDeviceType.A5:
                         kv_cache_spec[layer_name] = Compress4AttentionSpec(
                             block_size=block_size,
                             num_kv_heads=1,
@@ -3462,7 +3481,7 @@ class NPUModelRunner(GPUModelRunner):
                             indexer_scale_dtype=torch.float16,
                         )
                 elif layer_id % 2 != 0:
-                    if get_ascend_device_type() == AscendDeviceType.A5:
+                    if get_ascend_device_type() == AscendDeviceType.A5 and not BENCHMARK_PREFIX_REUSE:
                         kv_cache_spec[layer_name] = Compress128AttentionSpec(
                             block_size=block_size,
                             num_kv_heads=1,
@@ -3655,6 +3674,15 @@ class NPUModelRunner(GPUModelRunner):
             block_num_pad = block_num_total - block_num_in_use
             state_block_table[i][block_num_pad : block_num_pad + block_num_in_use] = \
                 swa_block_table[i][:block_num_in_use]
+
+            if BENCHMARK_PREFIX_REUSE:
+                start_position = int(query_end_position[i] - query_lens[i] + 1)
+                if start_position:
+                    previous_page = (start_position - 1) // block_size
+                    expected = base_block + previous_page % block_multiple
+                    if state_block_table[i][previous_page] != expected:
+                        raise ValueError("Benchmark chunk loses the compressor history page; "
+                                         "use aligned 128/256-token chunks")
 
         return swa_slot_mapping, swa_block_table, state_block_table
 

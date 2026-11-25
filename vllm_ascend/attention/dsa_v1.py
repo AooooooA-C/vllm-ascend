@@ -20,6 +20,8 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.benchmark_timer import core_scope
+from vllm_ascend.core.benchmark_prefix_reuse import ENABLED as BENCHMARK_PREFIX_REUSE
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -42,6 +44,22 @@ else:
 
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
+
+
+def _sparse_attention_metadata(**kwargs):
+    if BENCHMARK_PREFIX_REUSE and get_ascend_device_type() == AscendDeviceType.A5:
+        from vllm_ascend.attention.benchmark_a5_mla import metadata_op
+        return metadata_op(**kwargs)
+    return torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(**kwargs)
+
+
+def _timed_sparse_attention(*args, **kwargs):
+    if BENCHMARK_PREFIX_REUSE and get_ascend_device_type() == AscendDeviceType.A5:
+        from vllm_ascend.attention.benchmark_a5_mla import attention_op
+        return attention_op(*args, **kwargs)
+    # Argument preparation stays outside the core operator measurement.
+    with core_scope("sparse_attention"):
+        return torch.ops._C_ascend.npu_sparse_attn_sharedkv(*args, **kwargs)
 
 
 def hadamard_transform_ref(x: torch.Tensor, scale=1.0, attn_metadata=None):
@@ -793,7 +811,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_c4_cmp_seqlen_list = None
             cu_c128_cmp_seqlen_list = None
 
-        sas_c1_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+        sas_c1_metadata = _sparse_attention_metadata(
             num_heads_q=n_local_heads,
             num_heads_kv=1,
             head_dim=self.model_config.get_head_size(),
@@ -815,7 +833,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             has_cmp_kv=False,
             device=str(self.seqused_q.device))
 
-        sas_c4_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+        sas_c4_metadata = _sparse_attention_metadata(
             num_heads_q=n_local_heads,
             num_heads_kv=1,
             head_dim=self.model_config.get_head_size(),
@@ -840,7 +858,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             has_cmp_kv=True,
             device=str(self.seqused_q.device))
 
-        sas_c128_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+        sas_c128_metadata = _sparse_attention_metadata(
             num_heads_q=n_local_heads,
             num_heads_kv=1,
             head_dim=self.model_config.get_head_size(),
@@ -1015,7 +1033,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         index_topk = 512
         if self.compressor_ratio == 1:
             assert self.decode_sas_c1_metadata is not None
-            self.decode_sas_c1_metadata[:1024] = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+            self.decode_sas_c1_metadata[:1024] = _sparse_attention_metadata(
                 num_heads_q=n_local_heads,
                 num_heads_kv=1,
                 head_dim=self.model_config.get_head_size(),
@@ -1039,7 +1057,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 device=str(self.seqused_q.device))
         elif self.compressor_ratio == 4:
             assert self.decode_sas_c4_metadata is not None
-            self.decode_sas_c4_metadata[:1024] = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+            self.decode_sas_c4_metadata[:1024] = _sparse_attention_metadata(
                 num_heads_q=n_local_heads,
                 num_heads_kv=1,
                 head_dim=self.model_config.get_head_size(),
@@ -1065,7 +1083,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 device=str(self.seqused_q.device))
         else:
             assert self.decode_sas_c128_metadata is not None
-            self.decode_sas_c128_metadata[:1024] = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+            self.decode_sas_c128_metadata[:1024] = _sparse_attention_metadata(
                 num_heads_q=n_local_heads,
                 num_heads_kv=1,
                 head_dim=self.model_config.get_head_size(),
@@ -1493,7 +1511,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 block_size=128)
 
         if self.compress_ratio == 1:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 ori_block_table=attn_metadata.prefill.prefill_swa_block_table,
@@ -1510,7 +1528,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="TND" if self.enable_kv_tnd else "PA_ND")[0]
         elif self.compress_ratio == 4:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 cmp_kv=compressed_kv.unsqueeze(1)
@@ -1533,7 +1551,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="TND" if self.enable_kv_tnd else "PA_ND")[0]
         else:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=sliding_window_kv,
                 cmp_kv=compressed_kv.unsqueeze(1)
@@ -1697,7 +1715,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compressed_kv_slot_mapping.unsqueeze(-1),
                 compressed_kv.view(-1, compressed_kv.shape[-1]))
         if self.compress_ratio == 1:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 ori_block_table=attn_metadata.decode.state_block_table,
@@ -1713,7 +1731,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="PA_ND")[0]
         elif self.compress_ratio == 4:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 cmp_kv=kv_cache[0],
@@ -1733,7 +1751,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="PA_ND")[0]
         else:
-            attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            attn_output = _timed_sparse_attention(
                 q,
                 ori_kv=kv_state[0].unsqueeze(2),
                 cmp_kv=kv_cache[0],
@@ -1894,7 +1912,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer(
             query=q,
             key=kv_cache[1],
-            weights=weights.to(torch.float16),
+            weights=weights.to(torch.float32 if BENCHMARK_PREFIX_REUSE and
+                               soc_version == AscendDeviceType.A5 else torch.float16),
             query_dequant_scale=q_scale,
             key_dequant_scale=kv_cache[2],
             actual_seq_lengths_query=qlens,

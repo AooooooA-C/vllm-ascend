@@ -39,6 +39,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.kv_state_manager import KVStateManager
+from vllm_ascend.core.benchmark_prefix_reuse import (
+    ENABLED as BENCHMARK_PREFIX_REUSE, PrefixController, read_marker,
+    validate_config)
 
 logger = init_logger(__name__)
 
@@ -109,8 +112,25 @@ class KVStateScheduler(Scheduler):
                               self.vllm_config.kv_transfer_config.is_kv_consumer
         self.request_first_token: dict[int, dict[str, int]] = {
         }  # [client_index, [request_id, token_id]]
+        self._benchmark_prefix = None
+        self._benchmark_plans = {}
+        if BENCHMARK_PREFIX_REUSE:
+            validate_config(self.vllm_config)
+            if self.use_v2_model_runner:
+                raise ValueError("Benchmark prefix reuse requires the V1 Ascend model runner")
+            self._benchmark_prefix = PrefixController()
 
     def add_request(self, request: Request) -> None:
+        if self._benchmark_prefix is not None:
+            if (self.requests or request.sampling_params is None or
+                    request.sampling_params.max_tokens != 1 or
+                    request.lora_request is not None or request.mm_features or
+                    getattr(request.sampling_params, "prompt_logprobs", None) is not None or
+                    getattr(request, "prompt_embeds", None) is not None):
+                raise ValueError("Benchmark reuse requires one serial text request, "
+                                 "max_tokens=1, no adapters/embeddings/multimodal inputs")
+            self._benchmark_plans[request.request_id] = self._benchmark_prefix.admit(
+                read_marker(), request.prompt_token_ids)
         # Fill in placeholder tokens to enable full graph compatibility. Without
         # placeholders, graph matching may fail, forcing eager mode execution.
         if self.is_kv_consumer and request.kv_transfer_params is not None:
@@ -415,6 +435,14 @@ class KVStateScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                benchmark_cached_tokens = 0
+                if self._benchmark_prefix is not None:
+                    benchmark_cached_tokens = self._benchmark_plans[
+                        request.request_id]["cached_tokens"]
+                    if num_computed_tokens or num_new_local_computed_tokens:
+                        raise ValueError("Benchmark reuse cannot mix with native/external hits or resume")
+                    num_computed_tokens = benchmark_cached_tokens
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -511,7 +539,9 @@ class KVStateScheduler(Scheduler):
                         request.request_id]
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
+                    # Allocate PRIVATE capacity for P+Q while scheduling only Q.
+                    # The worker restores P; no fake native hit blocks are passed.
+                    num_new_tokens + num_external_computed_tokens + benchmark_cached_tokens,
                     num_new_local_computed_tokens,
                     new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
@@ -520,6 +550,8 @@ class KVStateScheduler(Scheduler):
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if self._benchmark_prefix is not None:
+                        raise RuntimeError("Insufficient KV capacity for benchmark prefix plus suffix")
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -704,6 +736,13 @@ class KVStateScheduler(Scheduler):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if self._benchmark_prefix is not None:
+            plan = self._benchmark_plans.pop(request.request_id)
+            success = (request.status in (RequestStatus.FINISHED_STOPPED,
+                                          RequestStatus.FINISHED_LENGTH_CAPPED)
+                       and request.num_output_tokens == 1
+                       and request.num_computed_tokens >= len(plan["tokens"]))
+            self._benchmark_prefix.finish(plan, success)
         self.kv_cache_manager.free(request)
         if self.kv_state_manager is not None:
             self.kv_state_manager.free(request)
@@ -714,6 +753,12 @@ class KVStateScheduler(Scheduler):
                     request.client_index].keys():
                 self.request_first_token[request.client_index].pop(
                     request.request_id)
+
+    def _preempt_request(self, request, *args, **kwargs):
+        if self._benchmark_prefix is not None:
+            raise RuntimeError("Benchmark prefix reuse does not support preemption; "
+                               "increase available HBM or reduce workload")
+        return super()._preempt_request(request, *args, **kwargs)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> bool:
         """
